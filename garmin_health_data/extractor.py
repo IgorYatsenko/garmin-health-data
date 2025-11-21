@@ -106,6 +106,27 @@ class GarminExtractor:
             garmin = Garmin()
             garmin.login(str(token_store_path))
             self.garmin_client = garmin
+            # Fetch user profile data across library versions.
+            profile_data = None
+            if hasattr(self.garmin_client, "get_user_profile"):
+                try:
+                    profile_data = self.garmin_client.get_user_profile()
+                except Exception:
+                    profile_data = None
+
+            # Fall back to garth profile if get_user_profile is unavailable.
+            if not profile_data and hasattr(self.garmin_client, "garth"):
+                profile_data = getattr(self.garmin_client.garth, "profile", None)
+
+            self.user_id = (
+                (profile_data or {}).get("id")
+                or (profile_data or {}).get("userId")
+                or (profile_data or {}).get("displayName")
+            )
+            # Set full_name if available for nicer logging.
+            if not getattr(self.garmin_client, "full_name", None):
+                self.garmin_client.full_name = (profile_data or {}).get("fullName")
+
             click.secho(
                 f"Authentication successful for {self.garmin_client.full_name}"
                 f" using saved tokens.",
@@ -125,8 +146,8 @@ class GarminExtractor:
             click.secho(error_msg, fg="red")
             raise RuntimeError(error_msg) from e
 
-        # Get user ID for later use.
-        self.user_id = self.garmin_client.get_user_profile().get("id")
+        if not self.user_id:
+            raise RuntimeError("Unable to determine Garmin user_id after login.")
 
     def _get_data_types_to_extract(
         self, data_types: Optional[List[str]] = None

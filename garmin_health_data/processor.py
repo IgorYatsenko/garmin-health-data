@@ -1093,7 +1093,17 @@ class GarminProcessor(Processor):
                 on_conflict_update=True,
             )
             click.echo("Processed main sleep data.")
-            return persisted_sleep[0].sleep_id
+            # We use an upsert helper that doesn't hydrate PKs on the ORM instance,
+            # so fetch the generated sleep_id for downstream child tables.
+            sleep_id = (
+                session.query(Sleep.sleep_id)
+                .filter(
+                    Sleep.user_id == int(self.user_id),
+                    Sleep.start_ts == start_ts,
+                )
+                .scalar()
+            )
+            return sleep_id
         else:
             click.secho("⚠️ No main sleep data found.", fg="yellow")
             return None

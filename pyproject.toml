@@ -7,7 +7,7 @@ name = "garmin-health-data"
 version = "2.0.2"
 description = "Extract your Garmin Connect health data to a local SQLite database"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9,<4.0"
 license = "Apache-2.0"
 authors = [{name = "Diego Scarabelli"}]
 keywords = ["garmin", "health", "data", "wellness", "fitness", "sqlite", "garmin-connect"]
