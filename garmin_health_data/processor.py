@@ -8,6 +8,7 @@ and health metrics.
 """
 
 import json
+import hashlib
 import re
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta, date
@@ -58,6 +59,12 @@ from garmin_health_data.models import (
     VO2Max,
 )
 
+TIMESTAMP_REGEX = (
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?(?:[+-]\d{2}:\d{2}|Z)?"
+)
+MAX_SIGNED_BIGINT = 2**63 - 1
+
 
 class GarminProcessor(Processor):
     """
@@ -91,7 +98,14 @@ class GarminProcessor(Processor):
         # All files in a file set have same `user_id` and `timestamp`.
         first_file = file_set.file_paths[0]
         filename_parts = self._parse_filename(first_file.name)
-        self.user_id = filename_parts["user_id"]
+        raw_user_id = filename_parts["user_id"]
+        self.user_id = self._normalize_user_id(raw_user_id)
+        if self.user_id != raw_user_id:
+            click.secho(
+                f"ℹ️  Normalized non-numeric user id '{raw_user_id}' to "
+                f"'{self.user_id}' for database compatibility.",
+                fg="yellow",
+            )
         timestamp = filename_parts["timestamp"]
 
         click.echo(
@@ -186,16 +200,25 @@ class GarminProcessor(Processor):
 
         :param filename: Name of the file to parse.
         :return: Dictionary with `user_id`, `data_type`, and `timestamp`.
-        :raises ValueError: If filename doesn't match expected pattern.
+        :raises ValueError: If filename doesn't match expected pattern. User IDs may be
+            numeric or alphanumeric (e.g., UUIDs); they are normalized separately for
+            database compatibility.
         """
 
-        pattern = r"^(\d+)_([A-Z_]+)(?:_\d+)?_([0-9T:\-Z\.]+)\.(json|fit)$"
+        pattern = (
+            rf"^(?P<user_id>[^_]+)_(?P<data_type>[A-Z_]+)"
+            rf"(?:_(?P<activity_id>[^_]+))?_(?P<timestamp>{TIMESTAMP_REGEX})"
+            rf"\.(?P<file_extension>json|fit)$"
+        )
         match = re.match(pattern, filename)
 
         if not match:
             raise ValueError(f"Filename does not match expected pattern: {filename}.")
 
-        user_id, data_type, timestamp, file_extension = match.groups()
+        user_id = match.group("user_id")
+        data_type = match.group("data_type")
+        timestamp = match.group("timestamp")
+        file_extension = match.group("file_extension")
 
         return {
             "user_id": user_id,
@@ -203,6 +226,27 @@ class GarminProcessor(Processor):
             "timestamp": timestamp,
             "file_extension": file_extension,
         }
+
+    @staticmethod
+    def _normalize_user_id(user_id: str) -> str:
+        """
+        Convert user_id to a numeric string suitable for BigInteger columns.
+
+        If the user_id is already numeric, return as-is. Otherwise, derive a stable
+        numeric value using a SHA-256 hash constrained to a signed 64-bit range.
+        """
+
+        if user_id.isdigit():
+            return user_id
+
+        hashed = int(hashlib.sha256(user_id.encode("utf-8")).hexdigest(), 16)
+        normalized = str(hashed % MAX_SIGNED_BIGINT)
+
+        # Avoid a zero user_id which could violate expectations for positive keys.
+        if normalized == "0":
+            normalized = str(MAX_SIGNED_BIGINT)
+
+        return normalized
 
     @staticmethod
     def _convert_field_name(field_name: str) -> str:
@@ -277,15 +321,37 @@ class GarminProcessor(Processor):
 
         # Load and parse the JSON data.
         data = self._load_json_file(file_path)
-        profile_data = data["userData"]
+        profile_data = (
+            data.get("userData")
+            or data.get("userProfile")
+            or data.get("profile")
+            or data.get("user")
+            or data
+        )
+
+        if not isinstance(profile_data, dict):
+            raise ValueError(
+                f"USER_PROFILE payload missing expected fields in {file_path.name}."
+            )
 
         # Extract user demographics.
-        full_name = data.get("full_name")
-        birth_date = (
-            datetime.strptime(profile_data["birthDate"], "%Y-%m-%d").date()
-            if profile_data.get("birthDate")
-            else None
+        full_name = (
+            data.get("full_name")
+            or profile_data.get("fullName")
+            or profile_data.get("name")
         )
+
+        birth_date = None
+        birth_date_raw = profile_data.get("birthDate") or profile_data.get("birthdate")
+        if birth_date_raw:
+            try:
+                birth_date = datetime.strptime(birth_date_raw, "%Y-%m-%d").date()
+            except ValueError:
+                click.secho(
+                    f"⚠️  Unrecognized birthDate format in {file_path.name}: "
+                    f"{birth_date_raw}",
+                    fg="yellow",
+                )
 
         # Update user table with demographics if needed.
         if self.must_update_user:
@@ -2214,7 +2280,7 @@ class GarminProcessor(Processor):
         # Extract `activity_id` from filename.
         # FIT files have format: {user_id}_ACTIVITY_{activity_id}_{timestamp}.fit
         # Use regex to extract activity_id directly from filename.
-        pattern = r"^(\d+)_ACTIVITY_(\d+)_([0-9T:\-Z\.]+)\.fit$"
+        pattern = rf"^[^_]+_ACTIVITY_(\d+)_({TIMESTAMP_REGEX})\.fit$"
         match = re.match(pattern, file_path.name)
 
         if not match:
@@ -2222,7 +2288,7 @@ class GarminProcessor(Processor):
                 f"Cannot extract activity_id from filename: {file_path.name}"
             )
 
-        activity_id = int(match.groups()[1])
+        activity_id = int(match.group(1))
 
         # Check if `ts_data_available` is already True for this activity.
         existing_activity = (
